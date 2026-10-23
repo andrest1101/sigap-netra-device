@@ -1,4 +1,11 @@
-"""Bank Kosakata Audio Utuh Bahasa Indonesia untuk Sigap Netra."""
+"""Bank kata utuh Bahasa Indonesia - dibuat gen_kata.py
+559 entri
+
+Gabungkan ke TTSGen.py:
+    from kata_utuh import KATA_UTUH
+    DAFTAR_AUDIO_SISTEM.update(KATA_UTUH)
+"""
+
 KATA_UTUH = {
     "nol.wav": "nol",
     "satu.wav": "satu",

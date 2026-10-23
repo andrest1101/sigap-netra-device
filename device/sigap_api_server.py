@@ -1,4 +1,26 @@
-"""Sigap Netra - Server REST API & Perekam Transaksi Latar (Sipeed MaixCam)."""
+"""
+sigap_api_server.py - REST API Server & Perekam Transaksi Latar untuk MaixCam
+=============================================================================
+Menyediakan komunikasi luring antara aplikasi_utama (Sipeed MaixCam)
+dengan aplikasi pendamping Android (JembatanSigap.kt & Retrofit).
+
+Kontrak Sinkronisasi Bersegel (JembatanSigap.kt):
+- GET    /health               -> {id, fw, battery, pending_rows, token}
+- POST   /session/seal         -> {session_id, rows, sha1, bytes}
+- GET    /session/{sid}/csv    -> text/csv (berkas segel)
+- GET    /session/{sid}/img/{nama} -> image/jpeg
+- DELETE /session/{sid}        -> 204 No Content
+- GET    /sessions             -> Daftar sesi segel tertunda (pemulihan)
+
+Kontrak REST Langsung (RecyclerView & Web):
+- GET    /api/status           -> Status ringkas perangkat
+- GET    /api/transaksi        -> Riwayat transaksi deteksi (JSON)
+- GET    /foto/{nama}          -> Bukti foto fisik JPEG
+- GET    /api/download_csv     -> Unduh CSV aktif langsung
+- POST   /api/hapus_semua      -> Bersihkan riwayat foto & CSV
+- GET    / /laporan            -> Halaman visual HTML bukti transaksi
+"""
+
 import glob
 import hashlib
 import http.server
@@ -38,7 +60,7 @@ _APP_REF = None
 
 
 def pastikan_direktori():
-    """Pastikan direktori penyimpanan data dan berkas CSV aktif tersedia."""
+    """Memastikan folder data dan berkas CSV aktif tersedia."""
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
         os.makedirs(IMG_DIR, exist_ok=True)
@@ -50,7 +72,7 @@ def pastikan_direktori():
 
 
 def dapatkan_ip_lokal() -> str:
-    """Dapatkan alamat IP lokal MaixCam pada antarmuka jaringan aktif."""
+    """Mendapatkan alamat IP lokal MaixCam pada jaringan Wi-Fi."""
     for target in [("8.8.8.8", 80), ("10.66.18.1", 80)]:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -66,7 +88,7 @@ def dapatkan_ip_lokal() -> str:
 
 
 def hitung_sha1_file(path_file: str) -> str:
-    """Hitung nilai hash SHA1 berkas untuk verifikasi integritas transfer."""
+    """Menghitung SHA1 dari sebuah berkas untuk verifikasi integritas transfer."""
     h = hashlib.sha1()
     try:
         with open(path_file, "rb") as f:
@@ -81,7 +103,7 @@ def hitung_sha1_file(path_file: str) -> str:
 
 
 def hitung_baris_csv(path_file: str) -> int:
-    """Hitung jumlah baris data transaksi pada berkas CSV."""
+    """Menghitung jumlah baris data CSV (tanpa baris header)."""
     if not os.path.exists(path_file):
         return 0
     try:
@@ -93,7 +115,7 @@ def hitung_baris_csv(path_file: str) -> int:
 
 
 def nomor_terakhir_csv(path_file: str) -> int:
-    """Ambil nomor urut transaksi terakhir dari berkas CSV aktif."""
+    """Mendapatkan nomor urut transaksi terakhir dari CSV."""
     if not os.path.exists(path_file):
         return 0
     try:
@@ -112,7 +134,7 @@ def nomor_terakhir_csv(path_file: str) -> int:
 
 
 def dapatkan_dimensi(img):
-    """Dapatkan dimensi lebar dan tinggi citra secara aman."""
+    """Mendapatkan dimensi lebar dan tinggi objek citra secara aman (callable maupun properti)."""
     if img is None:
         return 640, 480
     try:
@@ -126,7 +148,10 @@ def dapatkan_dimensi(img):
 
 
 def hitung_ketajaman_citra(img) -> float:
-    """Hitung skor ketajaman citra berbasis Laplacian untuk deteksi anti-blur."""
+    """
+    Menghitung skor ketajaman berbasis Laplacian 1D pada sampel keabuan.
+    Menggunakan logika murni sigap_core jika tersedia.
+    """
     if img is None:
         return 0.0
     try:
@@ -153,7 +178,7 @@ def hitung_ketajaman_citra(img) -> float:
 
 
 def simpan_citra_jpeg(img, jalur_berkas: str) -> bool:
-    """Simpan objek citra ke berkas JPEG terkompresi."""
+    """Menyimpan objek citra (Maix image / numpy / PIL) ke berkas JPEG."""
     if img is None:
         return False
     for attr in ("save", "write", "to_jpeg"):
@@ -189,7 +214,7 @@ def simpan_citra_jpeg(img, jalur_berkas: str) -> bool:
 
 
 def buat_laporan_html():
-    """Perbarui berkas visualisasi riwayat transaksi berbasis HTML."""
+    """Memperbarui berkas laporan HTML visual bukti rekaman."""
     if not os.path.exists(ACTIVE_CSV):
         return
     try:
@@ -257,7 +282,7 @@ class PerekamTransaksi:
         self.worker.start()
 
     def catat(self, no, det, objek, durasi_ms, im_utama, im_kecil=None):
-        """Masukkan tugas pencatatan transaksi ke antrean non-blocking."""
+        """Memasukkan tugas pencatatan ke antrean (non-blocking)."""
         self.antrean.put({
             "no": int(no),
             "detik": float(det),
@@ -329,7 +354,7 @@ class PerekamTransaksi:
 
 
 class SigapApiHandler(http.server.BaseHTTPRequestHandler):
-    """Handler REST API untuk integrasi aplikasi pendamping Android."""
+    """Handler REST API resmi Kontrak Bagian 4 Sigap Netra & Aplikasi Kerabat."""
 
     def _set_headers(self, status=200, content_type="application/json", custom_headers=None):
         self.send_response(status)
@@ -343,7 +368,7 @@ class SigapApiHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def _verifikasi_token(self) -> bool:
-        """Validasi token otentikasi X-Device-Token pada permintaan HTTP."""
+        """Memeriksa header X-Device-Token. Toleran jika header tidak dikirim di endpoint publik."""
         req_token = self.headers.get("X-Device-Token")
         if req_token and req_token == DEVICE_TOKEN:
             return True
@@ -658,7 +683,7 @@ class SigapApiHandler(http.server.BaseHTTPRequestHandler):
 
 
 class SigapServer:
-    """Manajer server HTTP dan sistem pencatatan transaksi latar belakang."""
+    """Manajer Server HTTP dan antrean pencatatan transaksi."""
 
     def __init__(self, port=PORT_SERVER, app_ref=None):
         global _APP_REF
@@ -726,7 +751,7 @@ class SigapServer:
 
 
 def jalankan_server_latar(port=PORT_SERVER, app_ref=None) -> SigapServer:
-    """Inisialisasi dan jalankan server REST API dalam satu baris kode."""
+    """Fungsi pembantu untuk mengaktifkan API server dalam 1 baris kode."""
     srv = SigapServer(port=port, app_ref=app_ref)
     srv.start()
     return srv

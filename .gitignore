@@ -52,3 +52,8 @@ captures/
 Thumbs.db
 ehthumbs.db
 desktop.ini
+
+# Device cloud credentials & runtime state (never commit)
+device/config.py
+device/.cloud_state.json
+device/cloud_state.json

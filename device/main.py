@@ -1,4 +1,20 @@
-"""Sigap Netra V3 - Kacamata Asistif Cerdas Berbasis Edge AI (Gusti Hakim Thoriq Wicaksono)."""
+"""
+Aplikasi Utama V3 - SIGAP NETRA: Integrasi Penuh Periferal & Multi-Uang Pintar
+==============================================================================
+Alat bantu baca tunanetra berbasis Edge AI (Sipeed MaixCam / SoC SG2002).
+Fitur Versi 3:
+- Model YOLOv11n Charlie INT8/BF16 (Stabil & Teruji di MaixCAM).
+- Deduplikasi Spasial Sensitif Nominal (Class-Aware Dedup): aman menjumlahkan
+  uang bersebelahan tanpa risiko mengarang uang ganda pada uang lecek/terlipat.
+- Konsensus Temporal Multi-Frame Tangguh (6 Frame Burst).
+- Integrasi Periferal Lengkap: Tombol Fisik (A23), LiDAR TF-Luna (A18/A19),
+  Monitor Baterai ADS1115 (A15/A27), PP-OCR Photoshop USM Adaptif LiDAR.
+
+NAVIGASI & PEMICU UTAMA (Pin A23 & Touchscreen):
+    1. TEKAN 1x (Tunggal) -> PROSES (Pindai Uang / PP-OCR) / BUKA / LANJUT Baris
+    2. TEKAN 2x (Ganda)   -> Ganti MODE (AUTO -> UANG -> TEKS) / Pindah BAGIAN Menu
+    3. TAHAN    (Long)    -> ULANGI ucapan audio / kembali ke AWAL baris
+"""
 
 import glob
 import hashlib
@@ -43,81 +59,137 @@ try:
 except ImportError:
     cv2 = None
 
-# Identifikasi Kanal Perangkat Keras
-HW_CHANNEL = "GHTW"
+try:
+    import sigap_cloud
+except Exception:
+    sigap_cloud = None
 
-# Konfigurasi Output Audio
-VOICE_PROFILE = "MALE"  # "MALE" or "FEMALE"
+# ======================================================================
+# PILIHAN SUARA AUDIO (PRIA / PEREMPUAN)
+# "PRIA"      -> Menggunakan folder /root/audio_sigap (Suara Ardi)
+# "PEREMPUAN" -> Menggunakan folder /root/audio_sigap_perempuan (Suara Gadis)
+# ======================================================================
+MODEL_SUARA = "PRIA"  # <- Ubah ke "PEREMPUAN" untuk suara wanita
 
-def get_audio_dirs(profile=VOICE_PROFILE):
-    target = "audio_sigap_perempuan" if str(profile).upper() in ("FEMALE", "PEREMPUAN") else "audio_sigap"
-    paths = [f"/root/{target}", os.path.join(APP_DIR, target), "/root/audio_sigap", os.path.join(APP_DIR, "audio_sigap")]
-    return [p for p in dict.fromkeys(paths)]
+def tentukan_dir_audio(model_suara=MODEL_SUARA):
+    if str(model_suara).strip().upper() == "PEREMPUAN":
+        return [
+            "/root/audio_sigap_perempuan",
+            "/root/audio_perempuan",
+            os.path.join(APP_DIR, "audio_sigap_perempuan"),
+            "/root/audio_sigap",
+            "/root/audio_generated",
+            "/root/audio",
+            "/root",
+            os.path.join(APP_DIR, "audio_sigap"),
+            os.path.join(APP_DIR, "audio_generated"),
+            os.path.join(APP_DIR, "audio"),
+        ]
+    return [
+        "/root/audio_sigap",
+        "/root/audio_generated",
+        "/root/audio",
+        "/root",
+        os.path.join(APP_DIR, "audio_sigap"),
+        os.path.join(APP_DIR, "audio_generated"),
+        os.path.join(APP_DIR, "audio"),
+        "/root/audio_sigap_perempuan",
+        os.path.join(APP_DIR, "audio_sigap_perempuan"),
+    ]
 
-DIR_AUDIO = get_audio_dirs(VOICE_PROFILE)
-MODEL_SUARA = VOICE_PROFILE
-tentukan_dir_audio = get_audio_dirs
-
-# Konfigurasi Model YOLOv11n Delta
+DIR_AUDIO = tentukan_dir_audio(MODEL_SUARA)
 DIR_MODEL = os.path.join(APP_DIR, "models") if os.path.exists(os.path.join(APP_DIR, "models")) else "/root/models"
-NAMA_MODEL = [
-    "yolo11n_rupiah_delta_int8.mud",
-    "yolo11n_rupiah_delta_bf16.mud",
-]
+NAMA_MODEL = ["yolo11n_rupiah_delta_int8.mud",
+              "yolo11n_rupiah_delta_bf16.mud",
+              "yolo11n_rupiah_charlie_int8.mud",
+              "yolo11n_rupiah_charlie_bf16.mud",
+              "yolo11n_rupiah_v3_int8.mud",
+              "yolo11n_rupiah_v3_bf16.mud",
+              "yolo11n_rupiah_v2_int8.mud"]
 
-# Jalur Pencarian Model PP-OCR
+# Urutan prioritas model OCR (pp_ocr_640_en adalah model det 640 hasil benchmark akurasi tinggi)
 DAFTAR_OCR = [
     "/root/OCR/pp_ocr_640_en.mud",
     "/root/OCR/pp_ocr_640.mud",
     "/root/models/pp_ocr_640_en.mud",
     "/root/models/pp_ocr_640.mud",
+    "/root/OCR/pp_ocr_en.mud",
+    "/root/OCR/pp_ocr_v4.mud",
     "/root/models/pp_ocr.mud",
     os.path.join(APP_DIR, "models/pp_ocr_640_en.mud"),
     os.path.join(APP_DIR, "models/pp_ocr.mud"),
+    os.path.join(APP_DIR, "OCR/pp_ocr_640_en.mud"),
+    os.path.join(APP_DIR, "OCR/pp_ocr_en.mud"),
 ]
-MODEL_OCR = next((p for p in DAFTAR_OCR if os.path.exists(p)), "/root/models/pp_ocr.mud")
+MODEL_OCR = next((p for p in DAFTAR_OCR if os.path.exists(p)),
+                 "/root/models/pp_ocr.mud")
 
 GAGAL_LAYAR_MAKS = 15
 
-# Parameter Deteksi & Deduplikasi Spasial
-CONF_MIN = 0.80             # Confidence Threshold
+# Ambang Deteksi & Parameter Operasional
+# Ambang KANDIDAT, bukan ambang keputusan. Penjaga sebenarnya adalah
+# voting antar frame. Ambang 0,80 membuat 4 dari 14 bidikan gagal
+# sepenuhnya karena seluruh frame kosong (Tahap 1, Perbaikan 3b).
+CONF_MIN = 0.80
 CONF_MIN_UANG = 0.80
-CONF_MIN_AUTO = 0.80
-IOU_DEDUP = 0.45            # Strict IoU for same denomination
-IOU_DEDUP_BEDA = 0.70       # Permissive IoU for different denominations
-IOU_NMS_YOLO = 0.65         # Loose NMS threshold before spatial dedup
-FRAME_CAPTURE = 6           # 6-frame burst consensus for temporal voting
+IOU_DEDUP = 0.45            # ambang ketat untuk nominal sama (cegah double count pada uang terlipat)
+IOU_DEDUP_BEDA = 0.70       # ambang toleran untuk nominal berbeda (dukung penjumlahan uang berdampingan)
+IOU_NMS_YOLO = 0.65         # NMS MaixPy longgar agar tidak membuang kandidat multi-uang sebelum dedup
+FRAME_CAPTURE = 6           # 6 frame burst untuk konsensus temporal yang stabil
 SETUJU_MIN = 2
 MIN_SENDIRI_OCR = 1
-FRAME_OCR = 1
+FRAME_OCR = 1              # petak sudah memberi pengamatan berulang
 BARIS_SEKALI = 3
 MODE_URUT = ["AUTO", "UANG", "TEKS"]
 
-# Pemotongan Petak & Prapemrosesan PP-OCR
-PETAK_OCR = True
+# Pemotongan petak untuk OCR.
+#
+# Letterbox 1280x720 ke 320x224 memberi skala 0,25 - huruf menu setinggi
+# 20 px menyusut jadi 5 px, di bawah batas kemampuan PP-OCRv3 (~8-10 px).
+# Petak 704x493 punya rasio yang sama dengan input model, jadi tidak ada
+# bilah hitam, dan skalanya 0,454 - huruf jadi 9,1 px.
+PETAK_OCR = True           # setel False untuk kembali ke cara lama
 PETAK_W, PETAK_H = 704, 493
-PETAK_X = [0, 576]
-PETAK_Y = [0, 227]
-MARGIN_SAMBUNGAN = 6
+PETAK_X = [0, 576]         # tumpang tindih 128 px
+PETAK_Y = [0, 227]         # tumpang tindih 266 px
+# Kotak yang tepinya menyentuh batas petak besar kemungkinan adalah
+# penggal dari teks yang terpotong, bukan kata utuh. Batas frame asli
+# (x=0, y=0, x=1280, y=720) tidak dihitung sebagai sambungan.
+MARGIN_SAMBUNGAN = 6      # piksel, pada koordinat frame asli
 
-# Pemisahan Kolom Menu & Deteksi Celah
-GUTTER_MIN_LEBAR = 0.05
-GUTTER_ZONA = (0.28, 0.72)
-GUTTER_MIN_KOTAK = 6
-GUTTER_MIN_ISI = 3
+# Pemisahan kolom pada menu bertata letak dua lajur.
+#
+# Lajur kosong (gutter) dicari hanya di bagian tengah frame, karena
+# tepi kiri dan kanan selalu kosong dan bukan pembatas kolom.
+GUTTER_MIN_LEBAR = 0.05        # minimal 5% lebar frame
+GUTTER_ZONA = (0.28, 0.72)     # daerah pencarian, relatif lebar frame
+GUTTER_MIN_KOTAK = 6           # di bawah ini tidak layak dibelah
+GUTTER_MIN_ISI = 3             # tiap kolom minimal sekian kotak
 
-# Batas Geometri & Rasio Aspek Uang Kertas
+# Uang kertas rupiah berukuran sekitar 141-151 mm x 65 mm, jadi
+# perbandingan sisinya 2,17 sampai 2,32. Rentang diperlebar untuk
+# menampung uang yang terlipat, miring, atau terpotong bingkai.
 RASIO_UANG_MIN = 1.40
 RASIO_UANG_MAKS = 3.40
+
+# Deteksi yang memenuhi hampir seluruh bingkai hampir pasti bukan
+# selembar uang, melainkan permukaan besar seperti poster atau meja.
 LUAS_UANG_MAKS = 0.72
 
-# Saklar Fitur Perangkat Keras
-ENABLE_LAYAR = True
-ENABLE_TOUCHSCREEN = False
-ENABLE_LIDAR = True
-VOLUME_DEFAULT = 75
+# Mode AUTO tetap lebih ketat. Di sana kesalahan lebih mahal: menyebut
+# poster sebagai uang tidak terdengar janggal oleh pengguna, sedangkan
+# gagal mendeteksi langsung disadari dan bisa diulang.
+CONF_MIN_AUTO = 0.80
 
-# Konfigurasi Pin Perangkat Keras
+# ======================================================================
+# SAKLAR FITUR HARDWARE (Ubah True / False sesuai kebutuhan)
+# ======================================================================
+ENABLE_LAYAR = True        # True = Layar LCD Aktif | False = Layar Mati (Hemat Daya)
+ENABLE_TOUCHSCREEN = True # True = Layar Sentuh Aktif | False = Khusus Tombol Fisik A23
+ENABLE_LIDAR = True        # True = Sensor Jarak TF-Luna Aktif | False = Tanpa Sensor Jarak
+VOLUME_DEFAULT = 75     # Tingkat Volume Suara (10 - 100%)
+
+# Konfigurasi Pin Periferal Hardware
 PIN_TOMBOL = "A23"
 PIN_LIDAR_TX, PIN_LIDAR_RX = "A19", "A18"
 PORT_LIDAR, BAUD_LIDAR = "/dev/ttyS1", 115200
@@ -128,12 +200,13 @@ ALAMAT_ADS = 0x48
 PGA_VOLT_ADS = 4.096
 RASIO_PEMBAGI_ADS = (100.0 + 51.0) / 51.0
 
-# Ambang Batas Spasial Jarak LiDAR (cm)
+# Ambang Jarak Saklar Spasial LiDAR (cm)
+# Diperluas ke 40 cm agar jarak baca menu/dokumen di atas meja tetap nyaman dan wajar
 BATAS_JARAK_TEKS_CM = 40.0
 JARAK_MIN_CM = 10.0
 JARAK_MAKS_UANG_CM = 100.0
 
-# Kurva Karakteristik Pelepasan Baterai LiPo 1S
+# Kurva Karakteristik Baterai LiPo 1S
 KURVA_LIPO = [
     (4.20, 100), (4.15, 95), (4.11, 90), (4.08, 85), (4.02, 80),
     (3.98, 75),  (3.95, 70), (3.91, 65), (3.87, 60), (3.85, 55),
@@ -157,7 +230,9 @@ def log(t, m):
     print("[%s] %s" % (t, m), flush=True)
 
 
-# Pengolah Pola Tombol Fisik
+# ======================================================================
+# PEMBACA POLA TOMBOL FISIK
+# ======================================================================
 class PolaTombolMandiri:
     def __init__(self, debounce=0.03, jeda_ganda=0.18, tahan=1.00):
         self._lalu = False
@@ -171,7 +246,7 @@ class PolaTombolMandiri:
         self.tahan = tahan
 
     def reset(self):
-        """Bersihkan status penekanan tombol untuk mencegah aksi hantu."""
+        """Buang semua status/sisa penekanan lama agar tidak memicu aksi hantu."""
         self._lalu = False
         self._mulai = 0.0
         self._lepas = None
@@ -196,7 +271,7 @@ class PolaTombolMandiri:
                 self._abaikan = True
                 return "ganda"
 
-        # Deteksi tahan langsung saat tombol ditekan (responsif instan)
+        # Deteksi tahan langsung saat tombol masih ditekan (responsif instan)
         if ditekan and not self._abaikan and not self._tahan_terpicu:
             if (sekarang - self._mulai) >= self.tahan:
                 self._tahan_terpicu = True
@@ -249,7 +324,7 @@ class Tombol:
             log("TOMBOL", "%s GAGAL diinisialisasi: %s" % (pin, e))
 
     def reset(self):
-        """Reset pelacak pola tombol setelah operasi pemrosesan intensif."""
+        """Reset status pola tombol agar tidak memicu aksi hantu setelah proses panjang."""
         if hasattr(self.pola, "reset"):
             self.pola.reset()
 
@@ -257,7 +332,7 @@ class Tombol:
         if not self.hidup or self._io is None or self.pola is None:
             return None
         try:
-            # Filter derau GPIO dengan sampling mayoritas 3x
+            # Majority vote 3x sampling untuk filter noise GPIO.
             sampel = 0
             for _ in range(3):
                 if self._io.value() == 0:
@@ -271,7 +346,9 @@ class Tombol:
             return None
 
 
-# Sensor Jarak TF-Luna LiDAR (UART1 @ A18/A19)
+# ======================================================================
+# SENSOR JARAK LIDAR TF-LUNA (UART1 di Pin A18/A19)
+# ======================================================================
 class Lidar:
     def __init__(self):
         self.ser = None
@@ -303,11 +380,11 @@ class Lidar:
             log("LIDAR", "UART1 belum aktif / tidak terdeteksi (%s)" % e)
 
     def baca_instan(self):
-        """Baca paket data TF-Luna terbaru dari buffer UART secara non-blocking."""
+        """Baca paket TF-Luna terbaru dari buffer UART secara non-blocking."""
         if self.ser is None or not self.aktif:
             return None
         try:
-            # Bersihkan buffer UART lama agar tidak memblokir thread utama
+            # Cegah penumpukan buffer UART lama dari pemblokiran thread utama
             n = self.ser.in_waiting
             if n > 100:
                 self.ser.read(n - 45)
@@ -333,7 +410,7 @@ class Lidar:
         return self.terakhir_baca
 
     def baca(self, timeout=0.25):
-        """Ukur jarak objek aktual dalam satuan sentimeter."""
+        """Membaca jarak objek (cm) dengan polling singkat."""
         if self.ser is None or not self.aktif:
             return None
         batas = time.time() + timeout
@@ -345,7 +422,9 @@ class Lidar:
         return self.terakhir_baca
 
 
-# Pemantau Baterai ADS1115 (I2C5 @ A15/A27)
+# ======================================================================
+# MONITOR BATERAI ADS1115 (I2C5 di Pin A15/A27)
+# ======================================================================
 class Baterai:
     KANDIDAT = [0x48, 0x49, 0x4A, 0x4B]
 
@@ -375,7 +454,7 @@ class Baterai:
                 except Exception as e:
                     log("BATERAI", "%s pinmap gagal: %s" % (pin, e))
 
-        # 1. Coba driver native maix.i2c pada I2C5 (Pin A15/A27)
+        # 1. Coba Driver Native maix.i2c di I2C5 (Pin A15/A27)
         try:
             from maix import i2c
             b_maix = i2c.I2C(5, i2c.Mode.MASTER)
@@ -391,7 +470,7 @@ class Baterai:
         except Exception:
             pass
 
-        # 2. Driver cadangan smbus pada bus 5
+        # 2. Fallback Driver smbus / smbus2 hanya di bus 5
         try:
             import smbus
         except ImportError:
@@ -488,7 +567,9 @@ class Baterai:
         return self.v_bat
 
 
-# Kamus Adaptasi Fonetik & Normalisasi Teks Ucap
+# ======================================================================
+# KAMUS ADAPTASI FONETIK & NORMALISASI TEKS UCAP
+# ======================================================================
 KATA_SERAPAN = {
     "special": "spesial",
     "speclal": "spesial",
@@ -686,7 +767,7 @@ KATA_SERAPAN = {
 
 
 def _kumpulan_kamus(kamus):
-    """Ambil himpunan kosakata kata sah dari kamus."""
+    """Ambil himpunan kata sah dari kamus, apa pun bentuk wadahnya."""
     if isinstance(kamus, dict):
         sumber = list(kamus.keys()) + [v for v in kamus.values()
                                        if isinstance(v, str)]
@@ -699,6 +780,7 @@ def _kumpulan_kamus(kamus):
     for k in sumber:
         if not isinstance(k, str):
             continue
+        # Entri kamus bisa berupa frasa ('nasi_goreng'); pecah jadi kata.
         for bagian in k.replace("_", " ").lower().split():
             if len(bagian) >= 2 and bagian.isalpha():
                 keluar.add(bagian)
@@ -706,7 +788,11 @@ def _kumpulan_kamus(kamus):
 
 
 def _pecahan_terbaik(kata, kamus, min_bagian=2, maks_bagian=3):
-    """Pecah kata majemuk menempel menggunakan pencocokan kamus dinamis."""
+    """Pecah satu kata menempel menjadi kata-kata kamus. -> list atau None.
+
+    Memakai pemrograman dinamis, memilih pecahan dengan jumlah potongan
+    paling sedikit. 'sotomadura' -> ['soto', 'madura'].
+    """
     n = len(kata)
     if n < 6:
         return None
@@ -729,7 +815,16 @@ def _pecahan_terbaik(kata, kamus, min_bagian=2, maks_bagian=3):
 
 
 def pisah_kata_menempel(teks, kamus):
-    """Pisahkan token kata menempel berdasarkan validasi kamus."""
+    """Pisahkan kata yang menempel memakai kamus.
+
+    Model en_PP_OCRv4_rec menghilangkan spasi pada teks rapat, sehingga
+    'Soto Madura' terbaca 'SotoMadura'. Ini perilaku pengenal, bukan
+    akibat pemotongan petak: kata yang sama bisa terbaca dengan spasi
+    pada bidikan lain.
+
+    Hanya kata yang TIDAK ada di kamus yang dicoba dipecah, dan hanya
+    bila seluruh potongannya ada di kamus. Kata yang sudah sah dibiarkan.
+    """
     sah = _kumpulan_kamus(kamus)
     if not sah:
         return teks
@@ -756,7 +851,7 @@ KATA_ANGKA_HARGA = {
 
 
 def kata_layak_ucap(kata_kata, kamus):
-    """Hitung rasio kata yang dikenali kamus dalam satu baris teks."""
+    """Nilai berapa banyak kata nama dalam satu baris yang dikenali. -> (jumlah, total)"""
     sah = _kumpulan_kamus(kamus)
     total = kenal = 0
     for w in kata_kata:
@@ -770,7 +865,7 @@ def kata_layak_ucap(kata_kata, kamus):
 
 
 def baris_derau(teks):
-    """Validasi kesesuaian baris terhadap struktur isi menu."""
+    """-> True bila baris kemungkinan besar bukan isi menu."""
     t = str(teks).strip().lower()
     if not t:
         return True
@@ -778,13 +873,24 @@ def baris_derau(teks):
         return True
     huruf = sum(1 for c in t if c.isalpha())
     angka = sum(1 for c in t if c.isdigit())
+    # Deretan angka panjang / nomor telepon / format waktu operasional
     if angka >= 8 and (huruf <= 4 or angka >= huruf * 2):
         return True
     return False
 
 
 def gabung_kata_ganda(teks):
-    """Eliminasi fragmen kata duplikat pada batas sambungan petak citra."""
+    """Hapus kata berdampingan yang merupakan penggal dari kata yang sama.
+
+    Fragmen sambungan petak SELALU berupa awalan atau akhiran, tidak
+    pernah potongan tengah: 'spesial' terpotong jadi 'spe' atau 'sial',
+    tidak pernah jadi 'esi'.
+
+    Aturan 'a in b' yang dipakai sebelumnya terlalu longgar dan membuang
+    pasangan kata yang sah: 'Ayam Bayam' menjadi 'Bayam', 'Soto Sotong'
+    menjadi 'Sotong'. Karena itu hanya awalan dan akhiran yang diterima,
+    dengan selisih panjang minimal dua huruf.
+    """
     def bersih(w):
         return w.lower().strip(".,:;-()")
 
@@ -794,14 +900,17 @@ def gabung_kata_ganda(teks):
         if keluar:
             a, b = bersih(keluar[-1]), bersih(w)
             if a and a == b:
-                continue                          
+                continue                            # persis sama
             if len(a) >= 3 and len(b) >= 3:
                 pendek, panjang = (a, b) if len(a) < len(b) else (b, a)
+                # Selisih minimal dua huruf. Tanpa syarat ini,
+                # 'soto' dan 'sotong' hanya berbeda dua huruf tapi
+                # 'nasi' dan 'nasib' hanya berbeda satu dan bisa sah.
                 awalan = panjang.startswith(pendek)
                 akhiran = panjang.endswith(pendek)
                 if (awalan or akhiran) and len(panjang) - len(pendek) >= 2:
                     if len(b) > len(a):
-                        keluar[-1] = w
+                        keluar[-1] = w              # simpan yang lebih lengkap
                     log("KATA", "gabung '%s' + '%s' -> '%s'"
                         % (a, b, bersih(keluar[-1])))
                     continue
@@ -950,7 +1059,11 @@ def gabung_harga_terpisah(baris_list, kamus=None):
     return hasil
 
 
-# Pemetaan substitusi karakter OCR ke digit angka untuk pola harga
+# Huruf yang sering tertukar dengan angka pada keluaran PP-OCR.
+# Daftar ini disusun dari salah baca yang benar-benar muncul di log
+# perangkat, bukan dari dugaan. Pemetaan HANYA diterapkan di dalam
+# kelompok angka yang sudah tertangkap regex harga, tidak pernah pada
+# teks biasa.
 KELIRU_ANGKA = {
     "i": "1", "l": "1", "I": "1", "t": "1", "|": "1", "!": "1",
     "o": "0", "O": "0", "Q": "0", "q": "0", "C": "0", "c": "0",
@@ -964,7 +1077,10 @@ KELIRU_ANGKA = {
 
 
 def normalisasi_teks_ucap(teks):
-    """Normalize digits, currency shorthand, and loanwords to speakable Indonesian words."""
+    """
+    Ubah representasi angka, nominal rupiah, singkatan harga (Rp12.000, 15k, 18.000),
+    dan kata serapan/salah baca OCR umum menjadi kata-kata bahasa Indonesia yang bisa diucapkan.
+    """
     s = str(teks).strip()
     if not s:
         return ""
@@ -974,7 +1090,7 @@ def normalisasi_teks_ucap(teks):
             return core.eja_angka(val)
         return [str(val)]
 
-    # 1. Pencocokan format mata uang Rupiah
+    # 1. Rp dengan nominal (mis. Rp17.000, Hp17.00, Ap15.000, Fp15.000, Rn2000, R2200, R972.00, p17.200, Rp5,000)
     def _ganti_rp(m):
         raw = m.group(1)
         for huruf, angka in KELIRU_ANGKA.items():
@@ -988,17 +1104,21 @@ def normalisasi_teks_ucap(teks):
             val = int(raw)
         except Exception:
             return m.group(0)
+        # 'Rp17.00' -> ekor dua digit. OCR memotong satu nol; harga menu
+        # di Indonesia praktis selalu kelipatan ribuan, jadi dikembalikan.
         if pisah and len(ekor) == 2:
             val *= 10
         elif pisah and len(ekor) == 1:
             val *= 100
         elif not pisah and val < 100:
-            return ""
+            return ""                  # angka kecil tanpa pemisah, bukan harga
         if not 500 <= val <= 5_000_000:
-            return ""
+            return ""                  # buang harga rusak (misal Rp.000 / Rp0) alih-alih diucapkan sebagai 'rp nol'
         return " " + " ".join(_eja(val)) + " rupiah "
 
-    # Cocokkan pola mata uang dengan toleransi prefiks OCR
+    # Huruf pembuka diperluas karena 'Rp' sering salah baca jadi
+    # Hp, Ap, Fp, Ra, Rn. Kelompok angkanya menerima huruf keliru
+    # yang dipetakan oleh KELIRU_ANGKA.
     _ANGKA = r"0-9" + "".join(re.escape(k) for k in KELIRU_ANGKA)
     s = re.sub(
         r'(?i)\b[rhafpn][pna0]?\.?\s*'
@@ -1006,7 +1126,7 @@ def normalisasi_teks_ucap(teks):
         r'|\d{3,6})\b',
         _ganti_rp, s)
 
-    # 2. Format singkatan ribuan ('7K', '12k', '20rb')
+    # 2. Harga singkatan 'K' atau 'rb' (mis. 15k, 15 K, 20rb, 7K, 4 K)
     def _ganti_k(m):
         try:
             val = int(m.group(1)) * 1000
@@ -1016,10 +1136,16 @@ def normalisasi_teks_ucap(teks):
             return m.group(0)
         return " " + " ".join(_eja(val)) + " rupiah "
 
-    # Parsing singkatan ribuan ('7K', '12k', '20rb')
+    # Format 'K' untuk ribuan: '7K', '12k', '4 K'. Umum pada menu warung
+    # dan kedai kopi. Dijalankan SETELAH aturan Rp supaya 'Rp7.000' yang
+    # sudah tertangani tidak diproses dua kali.
+    #
+    # Angka dibatasi 1-999 agar tahun ('2024k' tidak mungkin) dan kode
+    # panjang tidak ikut tertangkap. Batas bawah 1000 rupiah menutup
+    # kemungkinan '0K'.
     s = re.sub(r'(?i)\b([1-9][0-9]{0,2})\s*(?:k|rb)\b', _ganti_k, s)
 
-    # 3. Format angka ribuan dengan pemisah titik/koma (mis. 18.000, 30.000)
+    # 3. Format angka ribuan dengan pemisah titik/koma (mis. 18.000, 30.000, 12000)
     def _ganti_ribuan(m):
         raw = m.group(1).replace(".", "").replace(",", "")
         try:
@@ -1030,7 +1156,7 @@ def normalisasi_teks_ucap(teks):
 
     s = re.sub(r'\b(\d{1,3}(?:[.,]\d{3})+)\b', _ganti_ribuan, s)
 
-    # 4. Angka bulat 4-6 digit harga (mis. 12000, 5000)
+    # 4. Angka bulat 4-6 digit (mis. 12000, 5000)
     def _ganti_angka_panjang(m):
         try:
             val = int(m.group(1))
@@ -1042,7 +1168,7 @@ def normalisasi_teks_ucap(teks):
 
     s = re.sub(r'\b(\d{4,6})\b', _ganti_angka_panjang, s)
 
-    # 5. Angka bulat kecil harga (mis. 12, 100)
+    # 5. Angka bulat kecil (mis. 12, 100)
     def _ganti_angka(m):
         try:
             val = int(m.group(1))
@@ -1052,14 +1178,14 @@ def normalisasi_teks_ucap(teks):
 
     s = re.sub(r'\b(\d+)\b', _ganti_angka, s)
 
-    # 6. Adaptasi fonetik kata serapan dan koreksi salah baca OCR
+    # 6. Terjemahkan kata serapan / perbaiki salah baca OCR
     kata_list = s.split()
     kata_hasil = []
     for w in kata_list:
         bersih = "".join(c for c in w.lower() if c.isalnum())
         if not bersih:
             continue
-        # Saring artefak derau blur kamera acak
+        # Filter kata sampah acak ekstrem dari blur kamera
         if len(bersih) >= 6 and not any(v in bersih for v in "aeiou"):
             continue
         if bersih in KATA_SERAPAN:
@@ -1069,7 +1195,9 @@ def normalisasi_teks_ucap(teks):
     return " ".join(kata_hasil)
 
 
-# Subsistem Output Audio & Percakapan
+# ======================================================================
+# AUDIO
+# ======================================================================
 class Audio:
     def __init__(self, folder=DIR_AUDIO):
         self.folder = list(folder)
@@ -1095,7 +1223,7 @@ class Audio:
         threading.Thread(target=self._kerja, daemon=True).start()
 
     def perbarui_kartu(self, paksa=False):
-        """Pindai kartu suara ALSA untuk perutean output audio dinamis."""
+        """Pindai ulang kartu suara secara dinamis (hotplug Earphone / USB DAC seperti slot ATM)."""
         sekarang = time.time()
         if not paksa and (sekarang - getattr(self, "_waktu_cek_kartu", 0.0)) < 1.0:
             return self._dev or "default"
@@ -1128,7 +1256,7 @@ class Audio:
         return self._dev or "default"
 
     def setel_volume(self, vol_pct=None):
-        """Konfigurasi level volume mixer hardware ALSA."""
+        """Setel volume hardware ALSA secara langsung sebelum audio diputar."""
         if vol_pct is None:
             vol_pct = self.volume
         vol_pct = max(0, min(100, int(vol_pct)))
@@ -1141,7 +1269,7 @@ class Audio:
                 if k_num and k_num not in kartu_list:
                     kartu_list.insert(0, k_num)
 
-        # 1. Pindai kontrol mixer aktif melalui amixer
+        # 1. Pindai kontrol mixer aktual via 'amixer scontrols'
         kontrol_ditemukan = set()
         pola_sctl = re.compile(r"Simple mixer control '([^']+)'")
         for c in kartu_list:
@@ -1158,7 +1286,7 @@ class Audio:
         except Exception:
             pass
 
-        # 2. Terapkan target volume ke kontrol mixer yang terdeteksi
+        # 2. Terapkan volume ke seluruh kontrol yang terdeteksi
         for c, k in kontrol_ditemukan:
             if c is not None:
                 cmd = ("amixer -c %s sset '%s' %d%% unmute >/dev/null 2>&1 || "
@@ -1168,7 +1296,7 @@ class Audio:
                        "amixer set '%s' %d%% unmute >/dev/null 2>&1" % (k, vol_pct, k, vol_pct))
             os.system(cmd)
 
-        # 3. Cadangan ke nama kontrol ALSA standar
+        # 3. Fallback: terapkan ke semua nama kontrol umum
         kontrol_umum = ("DAC", "Master", "Speaker", "SPK", "PCM", "Headphone",
                         "Headset", "Playback", "Digital", "Lineout", "Output", "Volume")
         for c in kartu_list:
@@ -1197,7 +1325,7 @@ class Audio:
                 continue
             c, _ringkas, nama, d, sisa = m.groups()
             gabung = (nama + " " + sisa).lower()
-            # USB DAC eksternal prioritas utama (0), DAC internal sekunder (1)
+            # USB DAC / Headset eksternal mendapat prioritas tertinggi (0), DAC internal prioritas (1)
             usb = ("usb" in gabung or "5686" in gabung or "pcm" in gabung or "head" in gabung)
             hasil.append((0 if usb else 1, "plughw:%s,%s" % (c, d),
                           ("USB " if usb else "") + nama.strip()))
@@ -1252,7 +1380,7 @@ class Audio:
                         self._proc = proc
                     rc = proc.wait()
                     if rc != 0:
-                        # Pindai ulang kartu suara jika terjadi galat pemutaran audio
+                        # Jika gagal (misal earphone baru dicolok atau dicabut saat bermain), scan ulang dan coba lagi
                         dev_baru = self.perbarui_kartu(paksa=True)
                         proc2 = subprocess.Popen(["aplay", "-D", dev_baru, "-q", p])
                         with self._lock:
@@ -1267,7 +1395,7 @@ class Audio:
                 self._batal_flag = False
 
     def hentikan(self):
-        """Hentikan pemutaran audio seketika dan bersihkan antrean."""
+        """Hentikan seketika semua pemutaran audio dan bersihkan antrean."""
         with self._lock:
             self._antri.clear()
             self.sedang = ""
@@ -1282,7 +1410,7 @@ class Audio:
                 pass
 
     def sedang_bunyi(self):
-        """Periksa apakah output audio ucapan sedang aktif bersuara."""
+        """Cek apakah audio sedang aktif berbunyi."""
         with self._lock:
             return bool(self.sedang or self._antri or (self._proc and self._proc.poll() is None))
 
@@ -1309,7 +1437,7 @@ class Audio:
         if not teks_normal.strip():
             return []
 
-        # Buang kata yang tidak dikenali di luar kamus fonetik
+        # Filter kata tak layak ucap jika ada kamus
         teks_kata = []
         for w in teks_normal.split():
             k_clean = w.lower().strip(".,:;()-_")
@@ -1324,7 +1452,7 @@ class Audio:
             sah = _kumpulan_kamus(kamus_aktif)
             sah_lengkap = sah | KATA_ANGKA_HARGA
             kenal, total = kata_layak_ucap(bagian_kata, kamus_aktif)
-            # Pertahankan baris jika rasio kata yang dikenali melebihi ambang batas
+            # Jika mayoritas kata dikenali atau ada nama makanan, pertahankan
             if total >= 1 and kenal * 2 < total and kenal == 0:
                 log("UCAP", "ditekan: %d/%d kata dikenali -> '%s'"
                     % (kenal, total, " ".join(bagian_kata)))
@@ -1334,7 +1462,8 @@ class Audio:
                 if not bagian_kata:
                     return []
 
-            # Lewati kata tidak dikenal atau coba koreksi jarak Levenshtein
+            # Lewati kata tak dikenal dan tidak memiliki file audio mandiri,
+            # namun coba koreksi jarak Levenshtein terlebih dahulu sebelum melewatinya.
             bersih_kata = []
             for w in bagian_kata:
                 inti = w.lower().strip(".,:;()-_")
@@ -1359,7 +1488,8 @@ class Audio:
             urut = core.rencana_ucap(teks_normal, self.punya, boleh_eja=boleh_eja)
         except TypeError:
             urut_raw = core.rencana_ucap(teks_normal, self.punya)
-            # Hapus token cadangan ejaan satu huruf
+            # Karena sigap_core.py lama di perangkat (Maix) tidak mendukung boleh_eja=False,
+            # sistem lama mem-fallback eja huruf (a, b, c). Kita hapus manual ejaan huruf itu.
             urut = [u for u in urut_raw if len(u) > 1 or u in ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9")]
         if urut:
             log("UCAP", " -> ".join(urut))
@@ -1402,7 +1532,9 @@ class Audio:
             self.putar("total", *core.eja_angka(total), "rupiah")
 
 
-# Pipeline Inferensi Model AI (YOLOv11 & PP-OCR)
+# ======================================================================
+# MODEL INFERENSI (YOLO & PP-OCR)
+# ======================================================================
 class Model:
     def __init__(self):
         self.yolo = None
@@ -1465,7 +1597,7 @@ class Model:
     def muat_yolo(self):
         if self.yolo is not None:
             return True
-        # Bebaskan model PP-OCR dari memori TPU sebelum memuat YOLO
+        # Wajib bebaskan PP-OCR dari memori ION TPU terlebih dahulu!
         self._bebaskan("ocr")
         if not self.semua_jalur:
             self.galat_yolo = "tidak ada .mud di " + DIR_MODEL
@@ -1501,7 +1633,9 @@ class Model:
     def muat_ocr(self):
         if self.ocr is not None:
             return True
-        # Bebaskan YOLO dari memori ION TPU sebelum memuat PP-OCR untuk cegah OOM
+        # PENTING: Wajib bebaskan YOLO dari memori ION TPU MaixCam SG2002 terlebih dahulu!
+        # Memuat PP-OCR saat YOLO masih aktif akan melebihi kapasitas memori TPU ION
+        # (~35-40 MB) dan menyebabkan crash SIGSEGV / cvi_ion_alloc failed fatal.
         self._bebaskan("yolo")
         return self._coba_ocr()
 
@@ -1545,9 +1679,9 @@ class Model:
         return []
 
 
-# Validasi Aspek Rasio dan Geometri Uang Kertas
+# ======================================================================
 def uang_masuk_akal(d, lebar_frame, tinggi_frame):
-    """Validasi kewajaran aspek rasio dan geometri kotak deteksi uang."""
+    """-> True bila bentuk kotak deteksi wajar untuk selembar uang."""
     x, y, w, h = d["box"]
     if w <= 0 or h <= 0:
         return False
@@ -1555,7 +1689,7 @@ def uang_masuk_akal(d, lebar_frame, tinggi_frame):
 
 
 def _iou(a, b):
-    """Hitung nilai Intersection over Union (IoU) antara dua kotak pembatas."""
+    """Tumpang tindih dua kotak (x, y, w, h). Hanya untuk pencatatan."""
     ax, ay, aw, ah = a
     bx, by, bw, bh = b
     kiri, atas = max(ax, bx), max(ay, by)
@@ -1566,7 +1700,11 @@ def _iou(a, b):
 
 
 def dedup_boxes_aman(dets, iou_th=0.45, iou_beda_th=0.70):
-    """Deduplikasi kotak deteksi cerdas per kelas dengan fallback aman."""
+    """
+    Deduplikasi kotak deteksi cerdas dengan fallback aman.
+    Jika sigap_core di device belum diperbarui (misal saat dijalankan via MaixVision),
+    fungsi ini tetap menjalankan logika class-aware langsung tanpa crash TypeError.
+    """
     try:
         return core.dedup_boxes(dets, iou_th=iou_th, iou_beda_th=iou_beda_th)
     except TypeError:
@@ -1587,8 +1725,9 @@ def dedup_boxes_aman(dets, iou_th=0.45, iou_beda_th=0.70):
 
 def analisis_uang(model, frames, mode="AUTO"):
     if not model.muat_yolo():
-        return [], 0, "model tidak tersedia"
-    # Konsensus voting multi-frame untuk stabilitas bidikan tangan
+        return [], 0, "model tidak tersedia", 0.0
+    # Mode UANG dan AUTO memakai ambang yang tepat dan voting fleksibel (min 2 frame)
+    # untuk mengantisipasi getaran tombol/tangan pengguna tanpa mengorbankan akurasi.
     ambang = 0.80
     setuju_min = 2
 
@@ -1653,17 +1792,29 @@ def analisis_uang(model, frames, mode="AUTO"):
         % (len(per_frame), [len(f) for f in per_frame], setuju_min, mode))
 
     if not any(per_frame):
-        return [], 0, "tidak ada uang terdeteksi"
+        return [], 0, "tidak ada uang terdeteksi", 0.0
 
     suara = core.vote_notes(per_frame, setuju_min)
     if not suara:
-        return [], 0, "tidak ada uang terdeteksi"
+        return [], 0, "tidak ada uang terdeteksi", 0.0
     daftar = [d["nominal"] for d in suara]
-    return daftar, sum(daftar), None
+    confs = []
+    for d in suara:
+        try:
+            confs.append(float(d.get("conf", 0.0)))
+        except Exception:
+            pass
+    conf = (sum(confs) / len(confs)) if confs else 0.0
+    conf = max(0.0, min(1.0, conf))
+    return daftar, sum(daftar), None, conf
 
 
 def siapkan_ocr(img, ocr, jarak=None):
-    """Penajaman citra adaptif dan peningkat kontras berbasis jarak LiDAR."""
+    """
+    Photoshop Unsharp Mask + LiDAR Adaptive Distance Booster untuk input PP-OCR.
+    - Jarak Dekat (< 23 cm): Photoshop Unsharp Mask (5x5, amount 1.8, threshold 3).
+    - Jarak Menengah-Jauh (>= 23 cm): CLAHE Contrast Stretch + High-Boost (3x3, amount 3.6).
+    """
     target = getattr(image.Format, "FMT_BGR888", None)
     if target is None and image is not None:
         target = getattr(image.Format, "FMT_RGB888", None)
@@ -1683,7 +1834,7 @@ def siapkan_ocr(img, ocr, jarak=None):
     off_x = (w - nw) // 2
     off_y = (h - nh) // 2
 
-    # Pipeline penajaman citra adaptif
+    # Jika cv2 / numpy tersedia, terapkan Penajaman Adaptif
     if cv2 is not None and np is not None:
         try:
             buf = img.to_bytes()
@@ -1694,7 +1845,7 @@ def siapkan_ocr(img, ocr, jarak=None):
             interp = cv2.INTER_AREA if skala < 1.0 else cv2.INTER_CUBIC
             kecil = cv2.resize(arr, (nw, nh), interpolation=interp)
 
-            # Sesuaikan parameter unsharp mask berdasarkan jarak LiDAR
+            # Adaptasi parameter berdasarkan jarak LiDAR
             jauh = (jarak is not None and jarak >= 23.0)
             if jauh:
                 if kecil.ndim == 3:
@@ -1715,7 +1866,7 @@ def siapkan_ocr(img, ocr, jarak=None):
                 kanvas_arr = np.zeros((h, w), dtype=np.uint8)
             kanvas_arr[off_y:off_y + nh, off_x:off_x + nw] = sharpened
 
-            # Sesuaikan urutan kanal citra jika target BGR
+            # Sesuaikan urutan kanal jika target BGR
             fmt_bgr = getattr(image.Format, "FMT_BGR888", None)
             if kanvas_arr.ndim == 3 and fmt_bgr is not None and target == fmt_bgr:
                 kanvas_arr = kanvas_arr[:, :, ::-1]
@@ -1733,7 +1884,7 @@ def siapkan_ocr(img, ocr, jarak=None):
         except Exception as e:
             log("OCR", "penajaman adaptif gagal (%s) -> fallback" % e)
 
-    # Penajaman perangkat lunak tanpa OpenCV sebagai cadangan
+    # Fallback murni tanpa cv2
     hasil = img
     try:
         if target is not None and hasil.format() != target:
@@ -1754,7 +1905,7 @@ def siapkan_ocr(img, ocr, jarak=None):
 
 
 def _tandai_terpotong(kotak, ox, oy, pw, ph, lebar_frame, tinggi_frame):
-    """Tandai kotak deteksi yang menyentuh batas sambungan petak."""
+    """Beri tanda pada kotak yang menyentuh batas dalam petak."""
     for k in kotak:
         x, y, w, h = k["box"]
         kiri  = (ox > 0) and (x <= ox + MARGIN_SAMBUNGAN)
@@ -1766,7 +1917,7 @@ def _tandai_terpotong(kotak, ox, oy, pw, ph, lebar_frame, tinggi_frame):
 
 
 def bersihkan_sambungan(kotak, ambang_x=0.30):
-    """Hapus kotak deteksi ganda di area batas potongan petak."""
+    """Buang kotak yang menduplikasi kotak lain di daerah sambungan petak."""
     def sebaris(a, b):
         ay, ah = a["box"][1], a["box"][3]
         by, bh = b["box"][1], b["box"][3]
@@ -1797,7 +1948,7 @@ def bersihkan_sambungan(kotak, ambang_x=0.30):
 
 
 def _ocr_kotak(model, img, ox=0, oy=0, skala=1.0, jarak=None):
-    """Jalankan inferensi PP-OCR pada satu potongan citra."""
+    """OCR satu gambar. -> (list kotak dalam koordinat frame asli, n_objek)"""
     try:
         objs = model.ocr.detect(siapkan_ocr(img, model.ocr, jarak=jarak))
     except Exception as e:
@@ -1830,7 +1981,7 @@ def _ocr_kotak(model, img, ox=0, oy=0, skala=1.0, jarak=None):
 
 
 def _ocr_frame(model, img, cb_layar=None, jarak=None):
-    """Eksekusi inferensi PP-OCR pada satu frame utuh atau multi-petak."""
+    """OCR satu frame, dengan atau tanpa pemotongan petak."""
     if not PETAK_OCR:
         skala = min(model.ocr.input_width() / float(img.width()),
                     model.ocr.input_height() / float(img.height()))
@@ -1874,7 +2025,11 @@ def _ocr_frame(model, img, cb_layar=None, jarak=None):
 
 
 def cari_gutter(kotak, lebar_frame):
-    """Temukan celah vertikal yang membagi halaman menjadi dua kolom."""
+    """Cari lajur kosong vertikal yang membelah halaman jadi dua kolom.
+
+    Memproyeksikan seluruh kotak ke sumbu mendatar, lalu mencari celah
+    terlebar yang tidak tersentuh kotak mana pun. -> posisi x, atau None.
+    """
     if len(kotak) < GUTTER_MIN_KOTAK:
         return None
     langkah = max(1, int(lebar_frame / 160.0))
@@ -1912,7 +2067,7 @@ def cari_gutter(kotak, lebar_frame):
 
 
 def _adalah_kolom_harga(kotak_list):
-    """Periksa apakah kolom teks murni berisi deretan harga nominal."""
+    """-> True bila kolom ini murni berisi deretan harga (bukan menu terpisah)."""
     if not kotak_list:
         return False
     n_harga = 0
@@ -1926,17 +2081,24 @@ def _adalah_kolom_harga(kotak_list):
 
 
 def kelompokkan_kolom(kotak, lebar_frame):
-    """Kelompokkan kotak deteksi menjadi kolom bacaan berurutan kiri ke kanan."""
+    """Bagi kotak menjadi kolom, urut kiri ke kanan. -> list of list.
+
+    Menu berkolom tunggal atau menu yang kolom kanannya murni harga
+    mengembalikan satu kelompok, sehingga nama makanan dan harga tetap
+    berada di baris yang sama.
+    """
     x_belah = cari_gutter(kotak, lebar_frame)
     if x_belah is None:
         return [kotak]
     tengah = lambda k: k["box"][0] + k["box"][2] / 2.0
     kiri = [k for k in kotak if tengah(k) < x_belah]
     kanan = [k for k in kotak if tengah(k) >= x_belah]
-    # Tolak pembelahan jika kolom nyaris kosong (margin internal semu)
+    # Belahan yang menyisakan kolom nyaris kosong hampir pasti salah:
+    # yang terbaca sebagai gutter sebenarnya hanya margin dalam.
     if len(kiri) < GUTTER_MIN_ISI or len(kanan) < GUTTER_MIN_ISI:
         return [kotak]
-    # Pertahankan kolom harga agar tetap berpasangan dengan nama menu
+    # Jika kolom kanan murni harga (misal Rp17.000, Rp18.000), JANGAN dibelah
+    # supaya core.baca_baris_info dapat memasangkan nama dengan harganya.
     if _adalah_kolom_harga(kanan):
         log("KOLOM", "kolom kanan adalah daftar harga -> dibaca sebaris utuh")
         return [kotak]
@@ -1946,7 +2108,7 @@ def kelompokkan_kolom(kotak, lebar_frame):
 
 
 def skor_ketajaman_frame(img):
-    """Hitung skor ketajaman fokus citra menggunakan varians Laplacian 2D."""
+    """Hitung skor ketajaman Laplacian 2D pada area tengah citra."""
     try:
         w, h = img.width(), img.height()
         cx, cy = w // 2, h // 2
@@ -1971,7 +2133,7 @@ def skor_ketajaman_frame(img):
 
 
 def pilih_frame_tertajam(frames):
-    """Pilih satu frame tertajam dari deretan frame untuk mengatasi motion blur."""
+    """Pilih 1 frame paling tajam dari deretan frame kamera untuk anti-motion blur."""
     if not frames:
         return None
     if len(frames) == 1:
@@ -2052,7 +2214,7 @@ def analisis_teks(model, frames, kamus, cb_layar=None, jarak=None):
         if nama:
             log("JUDUL", "nama tempat: %s" % " ".join(nama))
 
-        # Bersihkan duplikasi dan baris sampah pada kategori menu
+        # Bersihkan isi setiap kategori dari duplikasi kembar dan baris sampah
         bagian_bersih = []
         for j, isi in bagian:
             isi_gabung = core.gabung_baris_kembar(isi, kamus) if hasattr(core, "gabung_baris_kembar") else isi
@@ -2087,7 +2249,9 @@ def urai_hasil_teks(hasil):
     return (hasil[0] if hasil else []), [], 0
 
 
-# Utilitas Koordinat UI & Pemotongan Teks
+# ======================================================================
+# TAMPILAN & NAVIGASI (LANGSUNG DETEKSI)
+# ======================================================================
 def di_dalam(kotak, x, y):
     kx, ky, kw, kh = kotak
     return kx <= x <= kx + kw and ky <= y <= ky + kh
@@ -2098,7 +2262,9 @@ def potong(teks, lebar_px, skala=1.0):
     return teks if len(teks) <= maks else teks[:maks - 1] + "~"
 
 
-# Server HTTP REST API untuk Sinkronisasi Aplikasi Android
+# ======================================================================
+# HTTP REST API SERVER UNTUK SINKRONISASI DENGAN APLIKASI ANDROID
+# ======================================================================
 IS_LINUX = sys.platform.startswith("linux")
 if IS_LINUX and os.path.exists("/root") and os.access("/root", os.W_OK):
     DEFAULT_BASE = "/root"
@@ -2111,9 +2277,9 @@ ACTIVE_CSV = os.path.join(DATA_DIR, "uji_rekam.csv")
 HTML_REKAM = os.path.join(DATA_DIR, "laporan_rekam.html")
 
 PORT_SERVER = int(os.environ.get("SIGAP_PORT", "8080"))
-DEVICE_ID = os.environ.get("SIGAP_DEVICE_ID", f"SIGAP-{HW_CHANNEL}-0007")
-FIRMWARE_VER = f"v1.2.0-{HW_CHANNEL.lower()}"
-DEVICE_TOKEN = os.environ.get("SIGAP_TOKEN", f"sigap-{HW_CHANNEL.lower()}-sg2002")
+DEVICE_ID = os.environ.get("SIGAP_DEVICE_ID", "SGP-NETRA-0007")
+FIRMWARE_VER = "v1.2.0-pkm"
+DEVICE_TOKEN = os.environ.get("SIGAP_TOKEN", "sigap-token-sg2002")
 
 CSV_HEADER = "no,detik,objek,jalur,lebar,tinggi,format,ms_baca,ketajaman,berkas,link_excel\n"
 
@@ -2259,9 +2425,8 @@ class PerekamTransaksi:
                 except Exception:
                     tajam = 1.0
 
-            sig_tag = f"{HW_CHANNEL.lower()}_sync"
             baris = "%d,%.1f,%s,%s,%d,%d,%s,%d,%.4f,%s,%s\n" % (
-                no, detik, objek, sig_tag, w_u, h_u, fmt_u,
+                no, detik, objek, "baru", w_u, h_u, fmt_u,
                 int(ms_baca), tajam, fn_u, ""
             )
             try:
@@ -2464,7 +2629,7 @@ class SigapApiHandler(http.server.BaseHTTPRequestHandler):
         path = self.path.split("?")[0].rstrip("/")
         pastikan_direktori_api()
 
-        # Pemicu pengambilan citra jarak jauh via POST /api/capture
+        # 0. Perintah Ambil Data / Pindai Jarak Jauh dari HP: POST /api/capture atau /api/proses
         if path in ("/api/capture", "/api/proses"):
             if SigapApiHandler.app_ref is not None:
                 SigapApiHandler.app_ref.minta_proses = True
@@ -2569,7 +2734,7 @@ class SigapApiHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(json.dumps({"error": "Endpoint DELETE tidak ditemukan"}).encode("utf-8"))
 
     def log_message(self, format, *args):
-        # Redam log akses rutin HTTP agar terminal tetap fokus
+        # Redam log akses rutin HTTP agar terminal MaixVision tetap fokus pada LiDAR/Deteksi
         pass
 
 
@@ -2629,12 +2794,7 @@ class SigapServer:
 
 class Aplikasi:
     def __init__(self):
-        log("APP", "=== Inisialisasi SIGAP NETRA (Full Peripheral) ===")
-        self.hw_channel = globals().get("HW_CHANNEL", "")
-        if self.hw_channel != "GHTW":
-            self.selesai = True
-            log("SYS", "Hardware channel mismatch: %s" % self.hw_channel)
-            return
+        log("APP", "=== Inisialisasi SIGAP NETRA V2 (Full Peripheral) ===")
         if ENABLE_LAYAR:
             try:
                 if os.path.exists("/sys/class/pwm/pwmchip0/pwm10"):
@@ -2672,17 +2832,17 @@ class Aplikasi:
                 log("KAMUS", "dasar %d kata" % len(self.kamus))
         self.audio.kamus = self.kamus
 
-        # Inisialisasi Tombol Fisik Pin A23
+        # Tombol Fisik Pin A23
         self.tombol = Tombol(PIN_TOMBOL)
 
-        # Inisialisasi Sensor Jarak TF-Luna LiDAR (Pin A18/A19)
+        # Saklar Spasial LiDAR TF-Luna (Pins A18/A19 di /dev/ttyS1)
         self.lidar = Lidar()
 
-        # Subsistem Pemantau Baterai ADS1115
+        # Monitor Baterai dinonaktifkan sementara untuk fokus isolasi LiDAR
         self.baterai = None
         self.terakhir_log_lidar = 0.0
 
-        # Inisialisasi Sensor Kamera Utama
+        # Kamera Utama: Buka resolusi standar ISP (1280x720 / 1024x576 / 800x448 / 640x480)
         self.cam = None
         for lw, lh in [(1280, 720), (1024, 576), (800, 448), (640, 480), (self.W, self.H)]:
             try:
@@ -2714,20 +2874,24 @@ class Aplikasi:
             self.ts = None
             log("TOUCHSCREEN", "Touchscreen NON-AKTIF (Hanya Tombol Fisik %s)" % PIN_TOMBOL)
 
-        # Inisialisasi Variabel Status Aplikasi
+        # Keadaan Utama
         self.selesai = False
         self.kotak = {}
         self.turun = False
-        # Jeda pasca-proses untuk cegah penekanan tombol palsu
+        # Masa abai setelah proses panjang. Selama OCR berjalan (4-5 detik)
+        # GPIO tidak disampel; tanpa jeda ini, jari yang masih menempel
+        # terbaca sebagai tekanan baru begitu gelang utama jalan lagi.
         self.abai_sampai = 0.0
-        # Tunda pengumuman siap hingga preview kamera aktif merender
+        # Pengumuman "siap" ditunda sampai gelang utama benar-benar
+        # menggambar frame kamera. Mengucapkannya lebih awal membuat
+        # pengguna membidik ke alat yang belum menerima masukan.
         self.minta_siap = False
         self.frame_siap = 0
 
         self.gagal_layar = 0
         self.kanvas_kamera = False
 
-        # Pelacakan Mode dan Status Operasional
+        # Mode & Status Deteksi
         self.idx_mode = 0
         self.keadaan = "IDLE"
         self.hasil_teks, self.hasil_ok, self.hasil_sampai = "", False, 0.0
@@ -2742,10 +2906,11 @@ class Aplikasi:
         self._adalah_kelompok_terakhir = False
         self.durasi_inferensi = 0.0
         self.server_api = None
+        self.sigap_cloud = None
         self.seq_rekam = 0
         self.minta_proses = False
 
-    # Prapemanasan Subsistem & Inisialisasi Server
+    # ------------------------------------------------------------------
     def pemanasan(self):
         if self.server_api is None:
             try:
@@ -2756,6 +2921,26 @@ class Aplikasi:
                 log("API", "Server REST MaixCam aktif pada port %d" % PORT_SERVER)
             except Exception as e:
                 log("API", "Gagal start API server: %s" % e)
+
+        if sigap_cloud is not None:
+            try:
+                cfg = sigap_cloud.muat_config()
+                if cfg:
+                    self.sigap_cloud = sigap_cloud.SigapCloud(
+                        cfg,
+                        {
+                            "get_battery_pct": self._cloud_baterai,
+                            "get_wifi_ssid": self._cloud_ssid,
+                            "on_command": self._cloud_perintah,
+                        },
+                    )
+                    self.sigap_cloud.start()
+                    log("CLOUD", "jembatan cloud aktif")
+                else:
+                    log("CLOUD", "config.py belum diisi; mode offline")
+            except Exception as e:
+                log("CLOUD", "gagal start: %s" % e)
+                self.sigap_cloud = None
 
         if not ENABLE_LAYAR or self.disp is None:
             return True
@@ -2811,49 +2996,39 @@ class Aplikasi:
         return img
 
     def bar_atas(self, img, kanan=""):
-        h_bar = 26
-        img.draw_rect(0, 0, self.W, h_bar, image.COLOR_BLACK, thickness=-1)
-        img.draw_string(10, 5, "SIGAP NETRA", color=image.COLOR_WHITE,
+        img.draw_rect(0, 0, self.W, 24, image.COLOR_BLACK, thickness=-1)
+        img.draw_string(6, 5, "SIGAP NETRA V2", color=image.COLOR_YELLOW,
                         scale=1.0, thickness=2)
         
-        # Indikator Baterai (Tengah-Kiri)
+        # Indikator Baterai di Bar Atas (Tengah-Kiri)
         if hasattr(self, "baterai") and self.baterai and self.baterai.aktif and self.baterai.persen is not None:
             pct = self.baterai.persen
             lvl = self.baterai.level
             c_bat = (image.COLOR_RED if lvl == "kritis"
                      else image.COLOR_YELLOW if lvl == "lemah"
                      else image.COLOR_GREEN)
-            teks_bat = "[BAT: %d%%]" % pct
+            teks_bat = "%d%%" % pct
             img.draw_string(140, 5, teks_bat, color=c_bat, scale=0.9, thickness=2)
 
         if kanan:
-            kanan_fmt = "[ %s ]" % kanan.upper().strip()
-            panjang_px = int(len(kanan_fmt) * 8 * 0.9)
-            img.draw_string(self.W - panjang_px - 10, 5, kanan_fmt,
-                            color=image.COLOR_GREEN, scale=0.9, thickness=2)
+            img.draw_string(self.W - 8 * len(kanan) - 8, 5, kanan,
+                            color=image.COLOR_YELLOW, scale=1.0, thickness=2)
 
     def deret_tombol(self, img, isi):
         n = len(isi)
-        gap = 8
-        margin = 8
-        lebar = (self.W - 2 * margin - (n - 1) * gap) // n
+        lebar = (self.W - (n + 1) * 6) // n
         tinggi = int(self.H * 0.13)
-        y = self.H - tinggi - margin
+        y = self.H - tinggi - 6
         for i, (kunci, teks, warna) in enumerate(isi):
-            x = margin + i * (lebar + gap)
-            k = (x, y, lebar, tinggi)
-            img.draw_rect(x, y, lebar, tinggi, warna, thickness=-1)
-            scale_t = 0.85
-            t_w = int(len(teks) * 8 * scale_t)
-            off_x = max(4, (lebar - t_w) // 2)
-            off_y = int((tinggi - 16) // 2)
-            img.draw_string(x + off_x, y + off_y,
-                            potong(teks, lebar - 8, scale_t),
-                            color=image.COLOR_WHITE, scale=scale_t, thickness=2)
+            k = (6 + i * (lebar + 6), y, lebar, tinggi)
+            img.draw_rect(k[0], k[1], k[2], k[3], warna, thickness=-1)
+            img.draw_string(k[0] + 6, k[1] + int(tinggi * 0.28),
+                            potong(teks, lebar - 10, 0.9),
+                            color=image.COLOR_WHITE, scale=0.9, thickness=2)
             self.kotak[kunci] = k
         return y
 
-    # Isyarat Pengumuman Suara Mode
+    # ------------------------------------------------------------------
     def ucap_mode(self):
         m = MODE_URUT[self.idx_mode]
         log("MODE", m)
@@ -2872,21 +3047,20 @@ class Aplikasi:
 
     def layar_proses(self, pesan, mulai=None):
         p = self.kanvas()
-        cx, cy = self.W // 2, self.H // 2
-        card_w, card_h = min(self.W - 32, 420), 140
-        x0, y0 = cx - card_w // 2, cy - card_h // 2
-        p.draw_rect(x0, y0, card_w, card_h, image.COLOR_BLACK, thickness=-1)
-        p.draw_rect(x0, y0, card_w, card_h, image.COLOR_GREEN, thickness=2)
-        p.draw_string(x0 + 20, y0 + 18, "PROCESSING...",
-                      color=image.COLOR_GREEN, scale=1.5, thickness=2)
-        p.draw_string(x0 + 20, y0 + 58, potong(pesan, card_w - 40, 1.1),
-                      color=image.COLOR_WHITE, scale=1.1, thickness=2)
+        p.draw_string(16, self.H // 2 - 44, "MEMPROSES...",
+                      color=image.COLOR_YELLOW, scale=2.0, thickness=2)
+        p.draw_string(16, self.H // 2 + 4, pesan,
+                      color=image.COLOR_WHITE, scale=1.2, thickness=2)
+
+        # Timer detik live stopwatch saat pemrosesan berlangsung
         if mulai is not None:
             durasi = max(0.0, time.time() - mulai)
-            p.draw_string(x0 + card_w - 75, y0 + 20, "%.1fs" % durasi,
-                          color=image.COLOR_WHITE, scale=1.1, thickness=2)
-        p.draw_string(x0 + 20, y0 + 98, "Mode: " + MODE_URUT[self.idx_mode],
-                      color=image.COLOR_YELLOW, scale=0.9, thickness=1)
+            teks_t = "Waktu: %.1f dtk" % durasi
+            p.draw_rect(self.W - 180, 10, 168, 28, image.COLOR_BLACK, thickness=-1)
+            p.draw_string(self.W - 174, 14, teks_t, color=image.COLOR_GREEN, scale=1.0, thickness=2)
+
+        p.draw_string(16, self.H // 2 + 38, "Mode: " + MODE_URUT[self.idx_mode],
+                      color=image.COLOR_WHITE, scale=1.0)
         self.tampilkan(p)
 
     def proses(self):
@@ -2898,7 +3072,12 @@ class Aplikasi:
         mode = MODE_URUT[self.idx_mode]
         log("PROSES", "mode " + mode)
 
-        # Gerbang Spasial Jarak LiDAR untuk panduan mode teks
+        # --------------------------------------------------------------
+        # GERBANG JARAK LIDAR (Spatial Distance Gate)
+        # Khusus Mode TEKS: memandu jarak baca dokumen/menu di atas meja.
+        # Mode UANG & AUTO: filter penolakan spasial ditiadakan agar pengguna
+        # tunanetra tidak terhalang saat memegang uang di depan kamera.
+        # --------------------------------------------------------------
         if hasattr(self, "lidar") and self.lidar.aktif and mode == "TEKS":
             batas_maks_awal = BATAS_JARAK_TEKS_CM
             jarak_terbaca = self.lidar.baca(timeout=0.25)
@@ -2951,21 +3130,27 @@ class Aplikasi:
             return "Kamera gagal", False
         log("KAMERA", "%d frame diambil" % len(frames))
 
-        daftar, total, kenapa = [], 0, None
+        daftar, total, kenapa, conf_uang = [], 0, None, 0.0
         if mode in ("AUTO", "UANG"):
             self.layar_proses("mendeteksi uang...", mulai=mulai)
-            daftar, total, kenapa = analisis_uang(self.model, frames, mode=mode)
+            daftar, total, kenapa, conf_uang = analisis_uang(self.model, frames, mode=mode)
 
         if daftar:
-            # Uang terdeteksi: prioritaskan pengumuman nominal uang
+            # Uang terdeteksi -> Abaikan LiDAR sepenuhnya dan ucapkan nominal
             self.baris_teks = []
             self.bagian = []
             self.idx_baca = 0
             self.idx_bagian = 0
             teks, ok = core.format_rupiah(daftar)[0], True
             self.audio.ucap_nominal(daftar, total)
+            if getattr(self, "sigap_cloud", None):
+                self.sigap_cloud.catat_uang(
+                    daftar,
+                    conf=conf_uang,
+                    jarak_cm=self._cloud_jarak(),
+                )
         elif mode in ("AUTO", "TEKS"):
-            # Uang tidak ditemukan: evaluasi gerbang LiDAR untuk mode teks
+            # Uang tidak ditemukan: Gerbang LiDAR memproteksi pembacaan teks
             if mode == "AUTO" and hasattr(self, "lidar") and self.lidar.aktif:
                 jarak_auto = self.lidar.baca(timeout=0.15) or self.lidar.terakhir_baca
                 if jarak_auto is not None:
@@ -2986,14 +3171,14 @@ class Aplikasi:
                             self.audio.ucap("terlalu jauh, dekatkan", bersihkan=True)
                         return "terlalu jauh, dekatkan (%.0f cm)" % jarak_auto, False
 
-            # Bebaskan YOLO dari memori TPU sebelum memuat PP-OCR
+            # Wajib bebaskan YOLO dari memori ION NPU sebelum memanggil OCR!
             self.model._bebaskan("yolo")
 
             self.layar_proses("membaca teks, mohon tunggu...", mulai=mulai)
             if self.audio.punya("mohon_tunggu"):
                 self.audio.putar("mohon_tunggu", bersihkan=True)
 
-            # Pilih frame tertajam dan segera bebaskan buffer frame lainnya
+            # Pilih 1 frame tertajam dan segera bebaskan 5 frame lainnya untuk menghemat RAM
             frame_fokus = pilih_frame_tertajam(frames)
             f_simpan = frame_fokus if frame_fokus is not None else (frames[0] if frames else None)
             frame_ocr = [frame_fokus] if frame_fokus else ([f_simpan] if f_simpan else [])
@@ -3028,6 +3213,12 @@ class Aplikasi:
                 else:
                     self.audio.ucap(" ".join(t), bersihkan=True)
                     teks = " ".join(t)
+                if getattr(self, "sigap_cloud", None):
+                    self.sigap_cloud.catat_teks(
+                        t,
+                        conf=0.9,
+                        jarak_cm=self._cloud_jarak(),
+                    )
             else:
                 teks, ok = (kenapa or kenapa_t or "tidak ada teks terbaca"), False
                 self.audio.putar("deteksi_gagal", bersihkan=True)
@@ -3057,7 +3248,7 @@ class Aplikasi:
             log("E2E", "Deteksi Gagal: %d ms (%.2f dtk)"
                 % (int(durasi_gagal * 1000), durasi_gagal))
 
-        # Catat transaksi ke riwayat untuk sinkronisasi Android
+        # Pencatatan transaksi untuk sinkronisasi ke aplikasi Android
         if hasattr(self, "server_api") and self.server_api is not None:
             try:
                 self.seq_rekam += 1
@@ -3135,7 +3326,8 @@ class Aplikasi:
             log("BACA", "  " + b)
             self.audio.ucap(b, bersihkan=(i == 0))
 
-        # Sambungkan isyarat selesai langsung pada potongan teks terakhir
+        # Jika ini adalah potongan terakhir, langsung sambungkan kata "selesai"
+        # sehingga mengalir alami di audio yang sama tanpa ada jeda hening!
         if (self.idx_baca + len(potongan)) >= len(self.baris_teks):
             if self.audio.punya("selesai"):
                 self.audio.putar("selesai")
@@ -3149,7 +3341,7 @@ class Aplikasi:
         self._menunggu_kelompok = True
 
     def _audio_sibuk(self):
-        """Periksa apakah antrean ucapan audio sedang aktif atau tertunda."""
+        """-> True bila masih ada yang sedang atau akan diucapkan."""
         for nama in ("sedang_bicara", "sibuk", "aktif", "sedang_bunyi"):
             f = getattr(self.audio, nama, None)
             if callable(f):
@@ -3166,7 +3358,7 @@ class Aplikasi:
         return False
 
     def jadwalkan_siap(self):
-        """Jadwalkan pengumuman siap setelah preview kamera stabil."""
+        """Tandai bahwa pengumuman 'siap' menunggu preview kembali jalan."""
         self.minta_siap = True
         self.frame_siap = 0
 
@@ -3186,25 +3378,25 @@ class Aplikasi:
             inferensi_str = (" (Inferensi AI: %.2f dtk)" % getattr(self, "durasi_inferensi", 0.0)) if getattr(self, "durasi_inferensi", 0.0) > 0 else ""
             log("BACA", "Selesai membaca seluruh baris -> Kamera aktif kembali (Total Sesi: %.2f dtk%s)"
                 % (durasi_total, inferensi_str))
-            # Perbarui pembacaan jarak LiDAR seketika
+            # Baca LiDAR instan seketika sebagai penanda akhir timer & kesiapan proses berikutnya
             if hasattr(self, "lidar") and self.lidar.aktif:
                 self.lidar.baca_instan()
                 if self.lidar.terakhir_baca is not None:
                     log("LIDAR", "Jarak Terbaca: %.1f cm (Kamera & LiDAR Siap)" % self.lidar.terakhir_baca)
-            # Render preview kamera langsung ke layar tanpa jeda
+            # Render instan tampilan kamera live ke layar seketika (0 ms jeda)
             self.gambar_deteksi()
             return
         self.ucap_kelompok()
 
     def gambar_deteksi(self):
-        # 1. Pembaruan reaktif jarak LiDAR secara real-time
+        # 1. Update bacaan jarak LiDAR secara reaktif dan real-time
         if hasattr(self, "lidar") and self.lidar.aktif and self.keadaan == "IDLE":
             self.lidar.baca_instan()
             if self.lidar.terakhir_baca is not None and time.time() - getattr(self, "terakhir_log_lidar", 0.0) >= 2.0:
                 self.terakhir_log_lidar = time.time()
                 log("LIDAR", "Jarak Terbaca: %.1f cm" % self.lidar.terakhir_baca)
 
-        # 1.1 Pembaruan tegangan baterai ADS1115 secara berkala
+        # 1.1 Update bacaan tegangan baterai ADS1115 berkala
         if hasattr(self, "baterai") and self.baterai and self.baterai.aktif and self.keadaan == "IDLE":
             self.baterai.perbarui()
 
@@ -3214,7 +3406,7 @@ class Aplikasi:
             img = self.kanvas()
         self.bar_atas(img, "mode " + MODE_URUT[self.idx_mode])
 
-        # 2. Lencana HUD jarak LiDAR di pojok kanan atas
+        # 2. Indikator LiDAR di pojok kanan atas
         if hasattr(self, "lidar") and self.lidar.aktif and self.lidar.terakhir_baca is not None:
             jarak = self.lidar.terakhir_baca
             batas_maks = (BATAS_JARAK_TEKS_CM
@@ -3222,20 +3414,15 @@ class Aplikasi:
                           else JARAK_MAKS_UANG_CM)
             if JARAK_MIN_CM <= jarak <= batas_maks:
                 warna_j = image.COLOR_GREEN
-                teks_j = "%.0f cm [READY]" % jarak
+                teks_j = "Jarak: %.0f cm [PAS]" % jarak
             elif jarak < JARAK_MIN_CM:
                 warna_j = image.COLOR_RED
-                teks_j = "%.0f cm [TOO CLOSE]" % jarak
+                teks_j = "Jarak: %.0f cm [DEKAT]" % jarak
             else:
                 warna_j = image.COLOR_YELLOW
-                teks_j = "%.0f cm [TOO FAR]" % jarak
-            
-            box_w = 150
-            box_x = self.W - box_w - 10
-            box_y = 32
-            img.draw_rect(box_x, box_y, box_w, 22, image.COLOR_BLACK, thickness=-1)
-            img.draw_rect(box_x, box_y, box_w, 22, warna_j, thickness=1)
-            img.draw_string(box_x + 8, box_y + 3, teks_j, color=warna_j, scale=0.75, thickness=2)
+                teks_j = "Jarak: %.0f cm [JAUH]" % jarak
+            img.draw_rect(self.W - 170, 26, 164, 22, image.COLOR_BLACK, thickness=-1)
+            img.draw_string(self.W - 166, 30, teks_j, color=warna_j, scale=0.75, thickness=2)
 
         self.kotak = {}
         if self.keadaan == "JUDUL":
@@ -3259,63 +3446,54 @@ class Aplikasi:
 
         if self.keadaan == "JUDUL":
             j, isi = self.bagian[self.idx_bagian]
-            card_h = 70
-            ty = y - card_h - 10
-            card_x = 10
-            card_w = self.W - 20
-            img.draw_rect(card_x, ty, card_w, card_h, image.COLOR_BLACK, thickness=-1)
-            img.draw_rect(card_x, ty, card_w, card_h, image.COLOR_GREEN, thickness=1)
-            img.draw_string(card_x + 10, ty + 6, "Bagian %d dari %d"
+            ty = y - 68
+            img.draw_rect(0, ty, self.W, 64, image.COLOR_BLACK, thickness=-1)
+            img.draw_string(6, ty + 3, "bagian %d dari %d"
                             % (self.idx_bagian + 1, len(self.bagian)),
-                            color=image.COLOR_YELLOW, scale=0.85, thickness=1)
-            img.draw_string(card_x + 10, ty + 24, potong(j or "(tanpa judul)",
-                                                card_w - 20, 1.3),
-                            color=image.COLOR_WHITE, scale=1.3, thickness=2)
-            img.draw_string(card_x + 10, ty + 48, "%d item menu" % len(isi),
-                            color=image.COLOR_GREEN, scale=0.8, thickness=1)
+                            color=image.COLOR_YELLOW, scale=0.9, thickness=2)
+            img.draw_string(6, ty + 24, potong(j or "(tanpa judul)",
+                                                self.W - 12, 1.4),
+                            color=image.COLOR_GREEN, scale=1.4, thickness=2)
+            img.draw_string(6, ty + 48, "%d isi" % len(isi),
+                            color=image.COLOR_WHITE, scale=0.8)
         elif self.keadaan == "BACA":
             n = len(self.baris_teks)
             potongan = self.baris_teks[self.idx_baca:self.idx_baca + BARIS_SEKALI]
-            card_h = 22 * (len(potongan) + 1) + 12
-            ty = y - card_h - 10
-            card_x = 10
-            card_w = self.W - 20
-            img.draw_rect(card_x, ty, card_w, card_h, image.COLOR_BLACK, thickness=-1)
-            img.draw_rect(card_x, ty, card_w, card_h, image.COLOR_BLUE, thickness=1)
-            img.draw_string(card_x + 10, ty + 5, "Baris %d-%d dari %d"
+            ty = y - 20 - 22 * (len(potongan) + 1)
+            img.draw_rect(0, ty, self.W, 22 * (len(potongan) + 1) + 8,
+                          image.COLOR_BLACK, thickness=-1)
+            img.draw_string(6, ty + 3, "baris %d-%d dari %d"
                             % (self.idx_baca + 1,
                                 min(self.idx_baca + BARIS_SEKALI, n), n),
-                            color=image.COLOR_YELLOW, scale=0.85, thickness=1)
+                            color=image.COLOR_YELLOW, scale=0.9, thickness=2)
             for i, b in enumerate(potongan):
-                img.draw_string(card_x + 10, ty + 24 + i * 22,
-                                potong(b, card_w - 20, 1.0),
-                                color=image.COLOR_WHITE, scale=1.0, thickness=2)
+                img.draw_string(6, ty + 25 + i * 22,
+                                potong(b, self.W - 12, 1.0),
+                                color=image.COLOR_GREEN, scale=1.0, thickness=2)
         elif self.keadaan == "HASIL":
             sisa = max(0.0, self.hasil_sampai - time.time())
-            card_h = 56
-            ty = y - card_h - 10
-            card_x = 10
-            card_w = self.W - 20
-            warna_res = image.COLOR_GREEN if self.hasil_ok else image.COLOR_RED
-            img.draw_rect(card_x, ty, card_w, card_h, image.COLOR_BLACK, thickness=-1)
-            img.draw_rect(card_x, ty, card_w, card_h, warna_res, thickness=2)
-            img.draw_string(card_x + 12, ty + 8, potong(self.hasil_teks, card_w - 24, 1.3),
-                            color=warna_res, scale=1.3, thickness=2)
-            sub_info = "E2E: %d ms  |  Siap: %.0fs" % (self.e2e[-1] if self.e2e else 0, sisa)
-            img.draw_string(card_x + 12, ty + 34, sub_info, color=image.COLOR_WHITE, scale=0.85, thickness=1)
+            ty = y - 48
+            img.draw_rect(0, ty, self.W, 46, image.COLOR_BLACK, thickness=-1)
+            img.draw_string(6, ty + 3, potong(self.hasil_teks, self.W - 12, 1.2),
+                            color=(image.COLOR_GREEN if self.hasil_ok
+                                   else image.COLOR_RED),
+                            scale=1.2, thickness=2)
+            img.draw_string(6, ty + 26, "E2E %d ms   siap lagi %0.0f dtk"
+                            % (self.e2e[-1] if self.e2e else 0, sisa),
+                            color=image.COLOR_WHITE, scale=0.8)
             if time.time() >= self.hasil_sampai:
                 self.keadaan = "IDLE"
                 self.jadwalkan_siap()
         self.tampilkan(img)
 
     def urus_deteksi(self, klik, pola=None):
-        # Tangani permintaan proses jarak jauh dari aplikasi Android
+        # Penanganan permintaan ambil data / pindai langsung dari aplikasi HP
         if self.minta_proses:
             self.minta_proses = False
             if self.keadaan == "IDLE" and "proses" in self.kotak:
                 klik = (self.kotak["proses"][0] + 5, self.kotak["proses"][1] + 5)
 
-        # 1. Tahan Lama: interupsi atau batalkan operasi saat ini
+        # 1. TAHAN LAMA (Long Press) -> INTERRUPT / SKIP / BATAL / SELESAI KAMERA SIAP
         if pola == "tahan":
             durasi_total = max(0.0, time.time() - self.waktu_mulai_sesi) if self.waktu_mulai_sesi else 0.0
             log("TOMBOL", "TAHAN LAMA -> Hentikan Audio/TTS & Kamera Siap (Total Sesi: %.2f dtk)" % durasi_total)
@@ -3370,7 +3548,9 @@ class Aplikasi:
 
         if self.keadaan == "BACA":
             if di_dalam(self.kotak["proses"], *klik):
-                # Majukan antrean pembacaan teks ke kelompok baris berikutnya
+                # LANJUT harus MAJU. Sebelumnya tombol ini disatukan dengan
+                # SELESAI, sehingga maju_baca() tidak pernah terpanggil dan
+                # pengguna tidak pernah mendengar baris keempat dan seterusnya.
                 self.audio.hentikan()
                 self.maju_baca()
             elif di_dalam(self.kotak["kembali"], *klik):
@@ -3395,7 +3575,7 @@ class Aplikasi:
                 self.ucap_kelompok()          # kembali ke AWAL daftar
             return
 
-        # Status: IDLE (Siaga)
+        # Keadaan IDLE:
         if di_dalam(self.kotak["kembali"], *klik):
             log("APP", "tombol KELUAR ditekan")
             self.selesai = True
@@ -3412,7 +3592,7 @@ class Aplikasi:
                 self.hasil_ok = False
                 log("PROSES", traceback.format_exc())
 
-            # Bersihkan sisa event masukan selama pemrosesan berlangsung
+            # Buang sentuhan dan penekanan sisa selama pemrosesan berlangsung
             self.tombol.reset()
             self.abai_sampai = time.time() + 0.7
             self.turun = True        # paksa lepas dulu sebelum klik dianggap sah
@@ -3446,11 +3626,11 @@ class Aplikasi:
             else:
                 self.audio.putar("deteksi_gagal", bersihkan=True)
 
-    # Pemetaan Pola Tombol Fisik ke Aksi UI Virtual
+    # ------------------------------------------------------------------
     POLA_KE_KOTAK = {"tunggal": "proses", "ganda": "mode", "tahan": "ulangi"}
 
     def klik_dari_tombol(self, pola):
-        """Petakan pola ketukan tombol fisik menjadi koordinat sentuh virtual."""
+        """Ubah pola tekanan jadi titik klik virtual."""
         nama = self.POLA_KE_KOTAK.get(pola)
         if not nama or nama not in self.kotak:
             return None
@@ -3458,8 +3638,63 @@ class Aplikasi:
         log("TOMBOL", "%s -> Kotak %s (Keadaan: %s)" % (pola, nama.upper(), self.keadaan))
         return (kx + kw // 2, ky + kh // 2)
 
+    # ------------------------------------------------------------------
+    # Integrasi cloud (opsional, tidak pernah memblokir deteksi/audio)
+    # ------------------------------------------------------------------
+    def _cloud_jarak(self):
+        """Jarak LiDAR terakhir sebagai int cm, atau None."""
+        try:
+            if (hasattr(self, "lidar") and self.lidar.aktif
+                    and self.lidar.terakhir_baca is not None):
+                n = int(round(float(self.lidar.terakhir_baca)))
+                if 0 <= n <= 100000:
+                    return n
+        except Exception:
+            pass
+        return None
+
+    def _cloud_baterai(self):
+        """Persentase baterai bila monitor aktif, atau None."""
+        try:
+            if (self.baterai and self.baterai.aktif
+                    and self.baterai.persen is not None):
+                n = int(self.baterai.persen)
+                if 0 <= n <= 100:
+                    return n
+        except Exception:
+            pass
+        return None
+
+    def _cloud_ssid(self):
+        """SSID tidak dibaca dari perangkat pada fase ini (privasi)."""
+        return None
+
+    def _cloud_perintah(self, tipe, payload):
+        """Handler perintah Firestore; lempar exception untuk perintah gagal."""
+        if tipe == "set_volume":
+            level = int(payload.get("level", 75))
+            level = max(0, min(100, level))
+            self.audio.setel_volume(level)
+            return "volume %d%%" % level
+        if tipe == "speak_text":
+            teks = str(payload.get("text", ""))[:200].strip()
+            if not teks:
+                raise RuntimeError("teks kosong")
+            urut = self.audio.ucap(teks)
+            if not urut:
+                raise RuntimeError("audio teks tidak tersedia")
+            return "teks diucapkan"
+        if tipe == "sync_now":
+            self.minta_proses = True
+            return "sinkronisasi dipicu"
+        if tipe == "restart":
+            raise RuntimeError("perintah restart belum didukung")
+        if tipe == "reprovision":
+            raise RuntimeError("mode pairing belum didukung")
+        raise RuntimeError("perintah %s belum didukung" % tipe)
+
     def tutup(self):
-        """Bebaskan seluruh sumber daya periferal hardware saat aplikasi ditutup."""
+        """Bebaskan seluruh resource hardware (kamera, display, UART, audio)."""
         log("APP", "Membersihkan alokasi memori & resource hardware...")
         if hasattr(self, "server_api") and self.server_api is not None:
             try:
@@ -3467,6 +3702,13 @@ class Aplikasi:
                 self.server_api = None
             except Exception:
                 pass
+        if getattr(self, "sigap_cloud", None):
+            try:
+                self.sigap_cloud.stop()
+            except Exception:
+                pass
+            finally:
+                self.sigap_cloud = None
         if hasattr(self, "audio") and self.audio:
             try:
                 self.audio.hentikan()
@@ -3509,12 +3751,12 @@ class Aplikasi:
             self.ucap_mode()
         print("\n  SIGAP NETRA V2 AKTIF -> INTEGRASI PENUH (Tombol Fisik PIN %s: %s)\n"
               % (PIN_TOMBOL, "AKTIF" if self.tombol.hidup else "MATI"), flush=True)
-        # Interval jeda debounce layar sentuh
+        # Debounce touchscreen: jeda minimum 300ms antar klik.
         _ts_terakhir = 0.0
         _TS_JEDA = 0.30  # detik
 
         while not self.selesai:
-            # Kebalkan dari jepitan tombol KEY_OK board di casing kacamata
+            # Kebalkan dari jepitan tombol KEY_OK board di dalam casing kacamata:
             if app.need_exit():
                 try:
                     app.set_exit_flag(False)
@@ -3523,13 +3765,16 @@ class Aplikasi:
             self.gambar_deteksi()
             sekarang = time.time()
 
-            # Lanjut otomatis membaca potongan teks berikutnya setelah audio selesai
+            # Auto-advance pembacaan teks: Jika kelompok 3 baris selesai diucapkan,
+            # otomatis lanjut ke kelompok baris berikutnya secara berkesinambungan.
             if self.keadaan == "BACA" and self._menunggu_kelompok and not self._audio_sibuk():
                 if sekarang - self._waktu_mulai_kelompok >= 0.1:
                     self._menunggu_kelompok = False
                     self.maju_baca()
 
-            # Ucapkan siap hanya setelah preview kamera stabil beberapa frame
+            # Pengumuman "siap" hanya boleh keluar setelah preview benar-benar
+            # jalan. Tiga frame berturut-turut memastikan kamera sudah pulih
+            # dari jeda selama pemrosesan, bukan sekadar satu frame kebetulan.
             if self.keadaan == "IDLE" and self.minta_siap:
                 if not self._audio_sibuk():
                     self.minta_siap = False
@@ -3557,7 +3802,9 @@ class Aplikasi:
             else:
                 klik = None
 
-            # Sampel transisi tepi tombol terus-menerus untuk hindari penekanan hantu
+            # perbarui() tetap dipanggil walau sedang diabaikan, supaya
+            # pelacakan tepi naik/turun tidak putus dan tidak menghasilkan
+            # tepi palsu saat masa abai berakhir.
             pola = self.tombol.perbarui(sekarang)
             if sekarang < self.abai_sampai:
                 pola, klik = None, None
@@ -3591,8 +3838,7 @@ if __name__ == "__main__":
         jejak = traceback.format_exc()
         print(jejak)
         try:
-            log_p = os.path.join(APP_DIR, "galat.log")
-            with open(log_p, "w") as f:
+            with open("/maixapp/apps/aplikasi_utama/galat.log", "w") as f:
                 f.write(jejak)
         except Exception:
             pass
